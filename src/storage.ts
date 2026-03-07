@@ -95,6 +95,31 @@ export async function writeGroupFile(
 }
 
 /**
+ * Upload a File/Blob into a group's workspace at the given path.
+ * Creates intermediate directories as needed. Writes the blob directly
+ * so binary files are preserved.
+ */
+export async function uploadGroupFile(
+  groupId: string,
+  filePath: string,
+  file: File | Blob,
+): Promise<void> {
+  const groupDir = await getGroupDir(groupId);
+  const { dirs, filename } = parsePath(filePath);
+
+  let dir = groupDir;
+  for (const seg of dirs) {
+    dir = await dir.getDirectoryHandle(seg, { create: true });
+  }
+
+  const fileHandle = await dir.getFileHandle(filename, { create: true });
+  const writable = await fileHandle.createWritable();
+  // FileSystemWritableFileStream.write supports Blob objects.
+  await writable.write(file);
+  await writable.close();
+}
+
+/**
  * List files and directories in a group's workspace directory.
  */
 export async function listGroupFiles(

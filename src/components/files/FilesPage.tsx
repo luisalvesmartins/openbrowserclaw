@@ -2,14 +2,14 @@
 // OpenBrowserClaw — Files page
 // ---------------------------------------------------------------------------
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, useRef } from 'react';
 import {
   Folder, Globe, Image, FileText, FileCode, FileJson, FileSpreadsheet,
   File, Home, Search, Download, Trash2, X, FolderOpen,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { DEFAULT_GROUP_ID } from '../../config.js';
-import { listGroupFiles, readGroupFile, deleteGroupFile } from '../../storage.js';
+import { listGroupFiles, readGroupFile, deleteGroupFile, uploadGroupFile } from '../../storage.js';
 import { FileViewerModal } from './FileViewerModal.js';
 
 interface FileEntry {
@@ -43,6 +43,7 @@ export function FilesPage() {
 
   const groupId = DEFAULT_GROUP_ID;
   const currentDir = path.length > 0 ? path.join('/') : '.';
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const loadEntries = useCallback(async () => {
     setLoading(true);
@@ -70,6 +71,26 @@ export function FilesPage() {
     setPreviewFile(null);
     setPreviewContent(null);
   }, [loadEntries]);
+
+  async function handleFilesSelected(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    setError(null);
+    setLoading(true);
+    try {
+      for (const f of Array.from(files)) {
+        const filePath = path.length > 0 ? `${path.join('/')}/${f.name}` : f.name;
+        await uploadGroupFile(groupId, filePath, f);
+      }
+      await loadEntries();
+    } catch (err) {
+      setError('Failed to upload file(s)');
+    } finally {
+      setLoading(false);
+      // reset input so same file can be re-selected later
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }
 
   async function handlePreview(name: string) {
     setPreviewFile(name);
@@ -113,27 +134,46 @@ export function FilesPage() {
     <div className="flex flex-col h-full">
       {/* Breadcrumbs */}
       <div className="px-4 py-2 bg-base-200 border-b border-base-300">
-        <div className="breadcrumbs text-sm">
-          <ul>
-            <li>
-              <button
-                className="link link-hover flex items-center gap-1"
-                onClick={() => setPath([])}
-              >
-                <Home className="w-4 h-4" /> workspace
-              </button>
-            </li>
-            {path.map((segment, i) => (
-              <li key={i}>
+        <div className="flex items-center justify-between">
+          <div className="breadcrumbs text-sm">
+            <ul>
+              <li>
                 <button
-                  className="link link-hover"
-                  onClick={() => setPath(path.slice(0, i + 1))}
+                  className="link link-hover flex items-center gap-1"
+                  onClick={() => setPath([])}
                 >
-                  {segment}
+                  <Home className="w-4 h-4" /> workspace
                 </button>
               </li>
-            ))}
-          </ul>
+              {path.map((segment, i) => (
+                <li key={i}>
+                  <button
+                    className="link link-hover"
+                    onClick={() => setPath(path.slice(0, i + 1))}
+                  >
+                    {segment}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={handleFilesSelected}
+            />
+            <button
+              className="btn btn-sm"
+              onClick={() => fileInputRef.current?.click()}
+              title="Upload local files to workspace"
+            >
+              Upload
+            </button>
+          </div>
         </div>
       </div>
 
