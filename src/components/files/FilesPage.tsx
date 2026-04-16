@@ -5,9 +5,11 @@
 import { useCallback, useEffect, useState, useRef } from 'react';
 import {
   Folder, Globe, Image, FileText, FileCode, FileJson, FileSpreadsheet,
-  File, Home, Search, Download, Trash2, X, FolderOpen,
+  File, Home, Search, Download, Trash2, X, FolderOpen, Archive,
+  CheckSquare, Square,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
+import JSZip from 'jszip';
 import { DEFAULT_GROUP_ID } from '../../config.js';
 import { listGroupFiles, readGroupFile, deleteGroupFile, uploadGroupFile } from '../../storage.js';
 import { FileViewerModal } from './FileViewerModal.js';
@@ -40,6 +42,10 @@ export function FilesPage() {
   const [previewContent, setPreviewContent] = useState<string | null>(null);
   const [viewerFile, setViewerFile] = useState<{ name: string; content: string } | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+  const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [zipping, setZipping] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const groupId = DEFAULT_GROUP_ID;
   const currentDir = path.length > 0 ? path.join('/') : '.';
@@ -70,6 +76,7 @@ export function FilesPage() {
     loadEntries();
     setPreviewFile(null);
     setPreviewContent(null);
+    setSelected(new Set());
   }, [loadEntries]);
 
   async function handleFilesSelected(e: React.ChangeEvent<HTMLInputElement>) {
@@ -103,6 +110,7 @@ export function FilesPage() {
     }
   }
 
+  /** Delete a single file (used from the preview pane). */
   async function handleDelete(name: string) {
     try {
       const filePath = path.length > 0 ? `${path.join('/')}/${name}` : name;
@@ -113,6 +121,68 @@ export function FilesPage() {
       loadEntries();
     } catch {
       setError('Failed to delete file');
+    }
+  }
+
+  /** Recursively delete all files inside a directory, then the directory itself. */
+  async function deleteRecursive(dirPath: string) {
+    try {
+      const raw = await listGroupFiles(groupId, dirPath);
+      for (const entry of raw) {
+        const isDir = entry.endsWith('/');
+        const cleanName = entry.replace(/\/$/, '');
+        const fullPath = dirPath === '.' ? cleanName : `${dirPath}/${cleanName}`;
+
+        if (isDir) {
+          await deleteRecursive(fullPath);
+        } else {
+          await deleteGroupFile(groupId, fullPath);
+        }
+      }
+      // Try deleting the directory entry itself (some storage backends need this)
+      try {
+        await deleteGroupFile(groupId, dirPath);
+      } catch {
+        // ignore — directory may have been implicitly removed
+      }
+    } catch {
+      // If we can't list it, try deleting it as a file
+      try {
+        await deleteGroupFile(groupId, dirPath);
+      } catch {
+        // skip
+      }
+    }
+  }
+
+  /** Bulk-delete all selected files and folders. */
+  async function handleBulkDelete() {
+    setDeleting(true);
+    setError(null);
+    try {
+      for (const name of selected) {
+        const entry = entries.find((e) => e.name === name);
+        const fullPath = path.length > 0 ? `${path.join('/')}/${name}` : name;
+
+        if (entry?.isDir) {
+          await deleteRecursive(fullPath);
+        } else {
+          await deleteGroupFile(groupId, fullPath);
+        }
+      }
+      // Clean up state
+      setBulkDeleteConfirm(false);
+      setSelected(new Set());
+      setPreviewFile(null);
+      setPreviewContent(null);
+      await loadEntries();
+    } catch (err) {
+      setError('Failed to delete some files');
+      console.error(err);
+      // Still reload to reflect partial progress
+      await loadEntries();
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -128,6 +198,122 @@ export function FilesPage() {
     a.download = name;
     a.click();
     URL.revokeObjectURL(url);
+  }
+
+  // ---- Selection helpers ----
+
+  function toggleSelection(name: string, e: React.MouseEvent) {
+    e.stopPropagation();
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) {
+        next.delete(name);
+      } else {
+        next.add(name);
+      }
+      return next;
+    });
+  }
+
+  function toggleSelectAll() {
+    if (selected.size === entries.length && entries.length > 0) {
+      setSelected(new Set());
+    } else {
+      setSelected(new Set(entries.map((e) => e.name)));
+    }
+  }
+
+  // ---- ZIP download ----
+
+  /** Recursively collect all files under a given directory path. */
+  async function collectFilesRecursive(
+    dirPath: string,
+    zip: JSZip,
+    zipPrefix: string,
+  ) {
+    const raw = await listGroupFiles(groupId, dirPath);
+    for (const entry of raw) {
+      const isDir = entry.endsWith('/');
+      const cleanName = entry.replace(/\/$/, '');
+      const fullPath = dirPath === '.' ? cleanName : `${dirPath}/${cleanName}`;
+      const zipPath = zipPrefix ? `${zipPrefix}/${cleanName}` : cleanName;
+
+      if (isDir) {
+        await collectFilesRecursive(fullPath, zip, zipPath);
+      } else {
+        try {
+          const content = await readGroupFile(groupId, fullPath);
+          zip.file(zipPath, content);
+        } catch {
+          // skip unreadable files
+        }
+      }
+    }
+  }
+
+  async function handleDownloadZip() {
+    setZipping(true);
+    setError(null);
+    try {
+      const zip = new JSZip();
+
+      // Determine which files to include
+      const filesToZip = selected.size > 0
+        ? entries.filter((e) => selected.has(e.name))
+        : entries; // all entries in current dir if nothing selected
+
+      for (const entry of filesToZip) {
+        const fullPath = path.length > 0
+          ? `${path.join('/')}/${entry.name}`
+          : entry.name;
+
+        if (entry.isDir) {
+          // Recursively add directory contents
+          await collectFilesRecursive(fullPath, zip, entry.name);
+        } else {
+          try {
+            const content = await readGroupFile(groupId, fullPath);
+            zip.file(entry.name, content);
+          } catch {
+            // skip unreadable files
+          }
+        }
+      }
+
+      const blob = await zip.generateAsync({ type: 'blob' });
+      const zipName = path.length > 0
+        ? `${path[path.length - 1]}.zip`
+        : 'workspace.zip';
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = zipName;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError('Failed to create ZIP file');
+      console.error(err);
+    } finally {
+      setZipping(false);
+    }
+  }
+
+  // Derived state
+  const allSelected = entries.length > 0 && selected.size === entries.length;
+  const selectedDirCount = [...selected].filter((name) => entries.find((e) => e.name === name)?.isDir).length;
+  const selectedFileCount = selected.size - selectedDirCount;
+
+  // Build a human-readable description of the selection for the delete modal
+  function selectionSummary(): string {
+    const parts: string[] = [];
+    if (selectedFileCount > 0) {
+      parts.push(`${selectedFileCount} file${selectedFileCount > 1 ? 's' : ''}`);
+    }
+    if (selectedDirCount > 0) {
+      parts.push(`${selectedDirCount} folder${selectedDirCount > 1 ? 's' : ''} (and all contents)`);
+    }
+    return parts.join(' and ');
   }
 
   return (
@@ -173,6 +359,40 @@ export function FilesPage() {
             >
               Upload
             </button>
+            {entries.length > 0 && (
+              <button
+                className="btn btn-sm gap-1"
+                onClick={handleDownloadZip}
+                disabled={zipping}
+                title={
+                  selected.size > 0
+                    ? `Download ${selected.size} selected item(s) as ZIP`
+                    : 'Download all files as ZIP'
+                }
+              >
+                {zipping ? (
+                  <span className="loading loading-spinner loading-xs" />
+                ) : (
+                  <Archive className="w-4 h-4" />
+                )}
+                {selected.size > 0 ? `ZIP (${selected.size})` : 'ZIP'}
+              </button>
+            )}
+            {selected.size > 0 && (
+              <button
+                className="btn btn-sm btn-error gap-1"
+                onClick={() => setBulkDeleteConfirm(true)}
+                disabled={deleting}
+                title={`Delete ${selected.size} selected item(s)`}
+              >
+                {deleting ? (
+                  <span className="loading loading-spinner loading-xs" />
+                ) : (
+                  <Trash2 className="w-4 h-4" />
+                )}
+                Delete ({selected.size})
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -199,19 +419,51 @@ export function FilesPage() {
             </div>
           ) : (
             <table className="table table-sm">
+              <thead>
+                <tr>
+                  <th className="w-8 text-center">
+                    <button
+                      className="btn btn-ghost btn-xs p-0"
+                      onClick={toggleSelectAll}
+                      title={allSelected ? 'Deselect all' : 'Select all'}
+                    >
+                      {allSelected ? (
+                        <CheckSquare className="w-4 h-4" />
+                      ) : (
+                        <Square className="w-4 h-4 opacity-40" />
+                      )}
+                    </button>
+                  </th>
+                  <th className="w-8" />
+                  <th>Name</th>
+                </tr>
+              </thead>
               <tbody>
                 {entries.map((entry) => (
                   <tr
                     key={entry.name}
                     className={`hover cursor-pointer ${
                       previewFile === entry.name ? 'active' : ''
-                    }`}
+                    } ${selected.has(entry.name) ? 'bg-base-200' : ''}`}
                     onClick={() =>
                       entry.isDir
                         ? setPath([...path, entry.name])
                         : handlePreview(entry.name)
                     }
                   >
+                    <td className="w-8 text-center">
+                      <button
+                        className="btn btn-ghost btn-xs p-0"
+                        onClick={(e) => toggleSelection(entry.name, e)}
+                        title={selected.has(entry.name) ? 'Deselect' : 'Select'}
+                      >
+                        {selected.has(entry.name) ? (
+                          <CheckSquare className="w-4 h-4 text-primary" />
+                        ) : (
+                          <Square className="w-4 h-4 opacity-40" />
+                        )}
+                      </button>
+                    </td>
                     <td className="w-8 text-center">
                       {(() => { const Icon = getFileIcon(entry.name, entry.isDir); return <Icon className="w-4 h-4 inline-block" />; })()}
                     </td>
@@ -333,7 +585,7 @@ export function FilesPage() {
         </div>
       )}
 
-      {/* Delete confirmation */}
+      {/* Single-file delete confirmation */}
       {deleteConfirm && (
         <dialog className="modal modal-open">
           <div className="modal-box max-w-sm">
@@ -355,6 +607,56 @@ export function FilesPage() {
           </div>
           <form method="dialog" className="modal-backdrop">
             <button onClick={() => setDeleteConfirm(null)}>close</button>
+          </form>
+        </dialog>
+      )}
+
+      {/* Bulk delete confirmation */}
+      {bulkDeleteConfirm && (
+        <dialog className="modal modal-open">
+          <div className="modal-box max-w-sm">
+            <h3 className="font-bold text-lg">Delete {selected.size} item{selected.size > 1 ? 's' : ''}?</h3>
+            <p className="py-4">
+              Are you sure you want to delete {selectionSummary()}? This cannot be undone.
+            </p>
+            {selectedDirCount > 0 && (
+              <div role="alert" className="alert alert-warning text-sm mb-2">
+                <svg xmlns="http://www.w3.org/2000/svg" className="stroke-current shrink-0 h-5 w-5" fill="none" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+                <span>Folder deletion is recursive — all nested files and subfolders will be removed.</span>
+              </div>
+            )}
+            <div className="max-h-40 overflow-y-auto text-sm opacity-70 mb-2">
+              <ul className="list-disc list-inside">
+                {[...selected].sort().map((name) => {
+                  const entry = entries.find((e) => e.name === name);
+                  return (
+                    <li key={name}>
+                      {name}{entry?.isDir ? '/' : ''}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+            <div className="modal-action">
+              <button
+                className="btn btn-ghost"
+                onClick={() => setBulkDeleteConfirm(false)}
+                disabled={deleting}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn btn-error gap-1"
+                onClick={handleBulkDelete}
+                disabled={deleting}
+              >
+                {deleting && <span className="loading loading-spinner loading-xs" />}
+                Delete {selected.size} item{selected.size > 1 ? 's' : ''}
+              </button>
+            </div>
+          </div>
+          <form method="dialog" className="modal-backdrop">
+            <button onClick={() => setBulkDeleteConfirm(false)} disabled={deleting}>close</button>
           </form>
         </dialog>
       )}
